@@ -2,6 +2,7 @@
 import asyncio
 from datetime import timedelta
 import logging
+import time
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -11,6 +12,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .api import HGSmartApiClient, HGSmartAuthError
 from .const import DOMAIN
 from .helpers import (
+    build_plan_value,
     get_schedule_slot_count,
     has_weekday_mask,
     is_supported_model,
@@ -19,6 +21,12 @@ from .helpers import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# The cloud attribute endpoint lags behind a successful plan write by a second
+# or two. Until it reports what we wrote (or this many seconds pass), refreshes
+# keep the written slot instead of the stale one, so the next write to the same
+# slot doesn't rebuild from old data and undo the previous change.
+PENDING_SCHEDULE_TTL = 60
 
 
 class HGSmartDataUpdateCoordinator(DataUpdateCoordinator):
@@ -35,6 +43,7 @@ class HGSmartDataUpdateCoordinator(DataUpdateCoordinator):
         self.api = api
         self._schedule_locks: dict[tuple[str, int], asyncio.Lock] = {}
         self._warned_unsupported: set[str] = set()
+        self._pending_schedules: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 
     def get_schedule_lock(self, device_id: str, slot: int) -> asyncio.Lock:
         """Return a per-slot lock, creating it lazily."""
@@ -42,6 +51,64 @@ class HGSmartDataUpdateCoordinator(DataUpdateCoordinator):
         if key not in self._schedule_locks:
             self._schedule_locks[key] = asyncio.Lock()
         return self._schedule_locks[key]
+
+    async def async_put_schedule(
+        self,
+        device_id: str,
+        slot: int,
+        hour: int,
+        minute: int,
+        portions: int,
+        enabled: bool,
+        suffix: str = "",
+    ) -> bool:
+        """Write a schedule slot and remember it until the cloud reports it back."""
+        success = await self.api.set_schedule(
+            device_id, slot, hour, minute, portions, enabled, suffix=suffix
+        )
+        if success:
+            self._pending_schedules[(device_id, slot)] = (
+                time.monotonic(),
+                {
+                    "enabled": enabled,
+                    "hour": hour,
+                    "minute": minute,
+                    "portions": portions,
+                    "slot": slot,
+                    "suffix": suffix,
+                },
+            )
+        return success
+
+    def _apply_pending_schedule(
+        self, device_id: str, slot: int, fetched: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return the pending write for a slot if the cloud hasn't caught up yet."""
+        pending = self._pending_schedules.get((device_id, slot))
+        if pending is None:
+            return fetched
+        written_at, expected = pending
+
+        def _plan(s: dict[str, Any]) -> str:
+            return build_plan_value(
+                s["hour"], s["minute"], s["portions"], slot, s["enabled"], s.get("suffix", "")
+            )
+
+        if _plan(fetched) == _plan(expected):
+            del self._pending_schedules[(device_id, slot)]
+            return fetched
+        if time.monotonic() - written_at > PENDING_SCHEDULE_TTL:
+            _LOGGER.warning(
+                "Schedule %d on %s still reads %s, not the %s written %ds ago",
+                slot + 1,
+                device_id,
+                _plan(fetched),
+                _plan(expected),
+                PENDING_SCHEDULE_TTL,
+            )
+            del self._pending_schedules[(device_id, slot)]
+            return fetched
+        return dict(expected)
 
     async def async_set_schedule_days(
         self, device_id: str, slot: int, days: list[str]
@@ -63,7 +130,7 @@ class HGSmartDataUpdateCoordinator(DataUpdateCoordinator):
             schedule["suffix"] = suffix
             self.async_update_listeners()
             try:
-                success = await self.api.set_schedule(
+                success = await self.async_put_schedule(
                     device_id,
                     slot,
                     schedule["hour"],
@@ -162,6 +229,11 @@ class HGSmartDataUpdateCoordinator(DataUpdateCoordinator):
                                 if device["type"].upper().startswith("SF")
                                 else "",
                             }
+
+                for slot in list(schedules):
+                    schedules[slot] = self._apply_pending_schedule(
+                        device_id, slot, schedules[slot]
+                    )
 
                 device_data[device_id] = {
                     "device_info": device,

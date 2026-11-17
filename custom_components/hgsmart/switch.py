@@ -128,7 +128,7 @@ class HGSmartScheduleSwitch(CoordinatorEntity, SwitchEntity):
             self.async_write_ha_state()
 
             try:
-                success = await self.api.set_schedule(
+                success = await self.coordinator.async_put_schedule(
                     self.device_id, self.slot, hour, minute, portions, enabled,
                     suffix=schedule.get("suffix", ""),
                 )
