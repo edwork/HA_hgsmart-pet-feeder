@@ -215,9 +215,33 @@ def format_days(days: list[str]) -> str:
     return ",".join(days)
 
 
+def is_sf_model(device_info: dict[str, Any]) -> bool:
+    """Return True for SF-series (RFID) feeders such as the SF35."""
+    return str(device_info.get("type", "")).upper().startswith("SF")
+
+
+def parse_batinfo(attributes: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Parse the SF35 ``batinfo`` attribute, e.g. "20100".
+
+    Format "PCLLL": P battery present (2) or not (0), C charging (1/0), LLL level
+    in percent, 255 when there is no battery. Seen on real devices: "20100"
+    (battery, mains), "21100" (charging after mains returned), "00255" (no battery).
+    """
+    raw = str((attributes or {}).get("batinfo", "")).strip()
+    if len(raw) != 5 or not raw.isdigit():
+        return None
+    level = int(raw[2:])
+    present = raw[0] != "0" and level <= 100
+    return {
+        "present": present,
+        "charging": present and raw[1] == "1",
+        "level": level if present else None,
+    }
+
+
 def get_max_schedule_portions(device_info: dict[str, Any]) -> int:
     """Return the max portions per scheduled meal (SF35 allows 24)."""
-    if str(device_info.get("type", "")).upper().startswith("SF"):
+    if is_sf_model(device_info):
         return SF_MAX_SCHEDULE_PORTIONS
     return MAX_PORTIONS
 
